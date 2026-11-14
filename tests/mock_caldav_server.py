@@ -228,8 +228,10 @@ class MockCalDAVHandler(BaseHTTPRequestHandler):
         path = self._path()
         if not path.startswith(root):
             return None
+        # A resource (no trailing slash) lives inside a known calendar collection.
+        if not path.endswith("/") and len(path.rstrip("/").split("/")) > 5:
+            return path.rstrip("/").split("/")[-2] in self.KNOWN_CALENDARS
         name = self._calendar_path() or ""
-        name = name.strip("/")
         # The collection root always exists; a named calendar only if it is known.
         return not name or name in self.KNOWN_CALENDARS
 

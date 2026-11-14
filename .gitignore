@@ -1,0 +1,9 @@
+# Dependencies (not vendored for git)
+node_modules/
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Mock server side effects
+tests/fixtures/mock_port.json

@@ -27,7 +27,7 @@ go stale.
 
    Verify it appears in `~/.pi/agent/settings.json` under `"packages"`. The extension is a single file loaded via jiti, so there is no build step.
 
-2. Provide the three environment variables to the agent process (see [Environment](#environment-provisioned-never-committed) below). A recommended pattern:
+2. Write the three credentials to `~/.pi/agent/.env-caldav`. The extension picks them up itself, so this file is all it needs — no shell-level wiring required:
 
    ```bash
    cat > ~/.pi/agent/.env-caldav <<'EOF'
@@ -38,12 +38,14 @@ go stale.
    chmod 600 ~/.pi/agent/.env-caldav
    ```
 
-3. Start pi-agent with the variables loaded, then `/reload` the agent:
+3. Start pi-agent (or `/reload` an already running agent) and verify the extension starts without a "credentials not set" warning:
 
    ```bash
    set -a; source ~/.pi/agent/.env-caldav; set +a
    pi <command>
    ```
+
+   Env vars take precedence over the file when both are present, so exporting them is still possible if you prefer, e.g. `set -a; source ~/.pi/agent/.env-caldav; set +a`. If pi-agent is launched by a desktop entry, `tmux`, or a systemd unit instead of your shell, the `.env-caldav` file covers it without any extra wiring.
 
    The extension is verified offline by `python3 -m unittest discover -s tests`; once the app password is provisioned, test against a live server with a manual probe:
 

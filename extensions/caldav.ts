@@ -3,12 +3,60 @@
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { readFileSync } from "node:fs";
 
 // ── Configuration (env-injected, never committed) ─────────────────────
 
-const PI_CALENDAR_URL = process.env.PI_CALENDAR_URL || "";
-const PI_CALENDAR_USER = process.env.PI_CALENDAR_USER || "";
-const PI_CALENDAR_PASSWORD = process.env.PI_CALENDAR_PASSWORD || "";
+/** Well-known locations of a KEY=VALUE config file, checked in order. */
+const CONFIG_FILES = [
+	"$PI_CODING_AGENT_DIR/.env-caldav",
+	"$HOME/.pi/agent/.env-caldav",
+	"~/.pi/agent/.env-caldav",
+];
+
+/** Read a KEY=VALUE file, ignoring blank lines and comments. Null when unreadable. */
+function readEnvFile(path: string): Record<string, string> | null {
+	try {
+		const content = readFileSync(path, "utf8");
+		const config: Record<string, string> = {};
+		for (const line of content.split(/\r?\n/)) {
+			const trimmed = line.trim();
+			if (!trimmed || trimmed.startsWith("#")) continue;
+			const idx = trimmed.indexOf("=");
+			if (idx === -1) continue;
+			config[trimmed.slice(0, idx).trim()] = trimmed.slice(idx + 1).trim();
+		}
+		return config;
+	} catch (_err) {
+		return null;
+	}
+}
+
+/** Expand $VARS and ~ in a path spec. */
+function resolvePathSpec(spec: string): string {
+	const expanded = spec.replace(/\$([A-Z_0-9]+)\b/g, (_, name) => process.env[name] || "");
+	if (!expanded.startsWith("~")) return expanded;
+	return `${process.env.HOME}/${expanded.slice(2)}`;
+}
+
+/** Read one credential from the config file, if present. */
+function readCredentialFromFile(key: string): string {
+	for (const spec of CONFIG_FILES) {
+		const config = readEnvFile(resolvePathSpec(spec));
+		if (!config || !config[key]) continue;
+		return config[key];
+	}
+	return "";
+}
+
+/** Resolve one credential key from an env var, falling back to a config file. */
+function resolveConfigValue(key: string): string {
+	return process.env[key] || readCredentialFromFile(key);
+}
+
+const PI_CALENDAR_URL = resolveConfigValue("PI_CALENDAR_URL");
+const PI_CALENDAR_USER = resolveConfigValue("PI_CALENDAR_USER");
+const PI_CALENDAR_PASSWORD = resolveConfigValue("PI_CALENDAR_PASSWORD");
 
 // Captured from the pi API object handed to the extension factory. Nested
 // helpers (webdav, propfind, tools) run in closures over this scope.
@@ -237,7 +285,7 @@ interface WebDavResult {
 }
 
 /** Build the curl argument list for one WebDAV round trip. */
-function buildCurlArgs(method: string, url: string, body?: string): string[] {
+function buildCurlArgs(method: string, url: string, body?: string, headers?: string[]): string[] {
 	const args = [
 		"-s",
 		"--basic",
@@ -253,6 +301,7 @@ function buildCurlArgs(method: string, url: string, body?: string): string[] {
 		"30",
 		url,
 	];
+	for (const header of headers ?? []) args.push("-H", header);
 	if (body) args.push("--data-raw", body);
 	return args;
 }
@@ -307,9 +356,10 @@ async function webdav(
 	method: string,
 	path: string,
 	body?: string,
+	headers?: string[],
 ): Promise<WebDavResult> {
 	const url = toUrl(path);
-	const result = await piApi.exec("curl", buildCurlArgs(method, url, body), {
+	const result = await piApi.exec("curl", buildCurlArgs(method, url, body, headers), {
 		timeout: 40_000,
 	});
 	if (result.killed) {
@@ -388,6 +438,18 @@ async function propfind(path: string): Promise<CalCollection[]> {
 	return parsePropfind(res);
 }
 
+/** Discovery roots exposed by Nextcloud; the first that responds wins. */
+const CALENDAR_ROOTS = ["/remote.php/caldav/calendars/", "/remote.php/dav/calendars/"];
+
+/** Whether a discovered collection matches one calendar name or href segment. */
+function matchesCollection(c: CalCollection, href: string): boolean {
+	return (
+		c.displayname === href ||
+		c.href.endsWith(`/${href}`) ||
+		localName(c.href).replace(/\//g, "") === href.replace(/\//g, "")
+	);
+}
+
 /**
  * Resolve `calendar` to a full calendar href. A bare name is resolved by
  * enumerating all collections at request time (fresh, never cached).
@@ -395,33 +457,38 @@ async function propfind(path: string): Promise<CalCollection[]> {
 async function resolveCalendar(href: string): Promise<string> {
 	if (/^https?:\/\//.test(href) || href.startsWith("/remote.php")) return href;
 	const base = normalizeBase();
-	const discovery = base
-		? `/remote.php/caldav/calendars/${PI_CALENDAR_USER}/`
-		: "/remote.php/caldav/calendars/";
-	const collections = await propfind(discovery);
-	const match = collections.find(
-		(c) =>
-			c.displayname === href ||
-			c.href.endsWith(`/${href}`) ||
-			localName(c.href).replace(/\//g, "") === href.replace(/\//g, ""),
-	);
-	if (!match) {
-		if (!href.trim()) {
-			throw new Error("calendar is required");
+	// 401/404 from the first discovery root is surfaced (it points at the real server);
+	// only unreachable roots are retried against the other one.
+	let lastError: Error | undefined;
+	for (const root of CALENDAR_ROOTS) {
+		let collections: CalCollection[] = [];
+		try {
+			collections = await propfind(`${root}${PI_CALENDAR_USER}/`);
+		} catch (err) {
+			lastError ??= err instanceof Error ? err : new Error(String(err));
+			continue;
 		}
-		throw new Error(
-			`Calendar "${href}" not found on the server (no matching collection in the discovered list)`,
-		);
+		if (!collections.length) continue;
+		const match = collections.find((c) => matchesCollection(c, href));
+		if (match) return `${base}${match.href}/`;
 	}
-	return `${base}${match.href}/`;
+	if (lastError) throw lastError;
+	if (!href.trim()) throw new Error("calendar is required");
+	throw new Error(
+		`Calendar "${href}" not found on the server (no matching collection in the discovered list)`,
+	);
 }
 
-/** Build a CalDAV REPORT query XML for a time range. */
-function reportQueryXml(from: string, to: string): string {
+/** Build a CalDAV REPORT query XML for one component type.
+
+ * SabreDAV (Nextcloud's CalDAV backend) requires a `<c:filter>` element with a
+ * direct `<c:comp-filter name="..."/>` child, and the time-range must live inside
+ * that comp-filter — a time-range on the VCALENDAR level is rejected. An empty
+ * comp-filter returns all objects of that component type. */
+function reportQueryXml(component: string, from?: string, to?: string): string {
 	const attrs = [from && `from="${from}"`, to && `to="${to}"`]
 		.filter(Boolean)
 		.join(" ");
-	const filter = attrs ? `<c:time-range ${attrs}/>` : `<c:time-range/>`;
 	return `<?xml version="1.0" encoding="utf-8"?>
 <c:calendar-query xmlns:c="urn:ietf:params:xml:ns:caldav" xmlns:d="DAV:">
   <d:prop>
@@ -432,12 +499,20 @@ function reportQueryXml(from: string, to: string): string {
       </d:prop>
     </c:calendar-data>
   </d:prop>
+  <c:filter>
+    <c:comp-filter name="${component}">${attrs ? `<c:time-range ${attrs}/>` : ""}</c:comp-filter>
+  </c:filter>
 </c:calendar-query>`;
 }
 
-/** Run a CalDAV REPORT and return the raw iCal responses. */
-async function reportEvents(calendar: string, from?: string, to?: string): Promise<WebDavResult> {
-	return webdav("REPORT", normalizeHref(calendar), reportQueryXml(from, to));
+/** Run a CalDAV calendar-query REPORT and return the raw iCal responses. */
+async function reportEvents(
+	calendar: string,
+	from?: string,
+	to?: string,
+	component = "VEVENT",
+): Promise<WebDavResult> {
+	return webdav("REPORT", normalizeHref(calendar), reportQueryXml(component, from, to), ["Depth: 1"]);
 }
 
 /** Parse a REPORT response into events/tasks. */
@@ -496,19 +571,20 @@ async function executeCreateEvent(params: {
 	const path = toPath(calendar);
 	if (!path) throw new Error(`calendar parameter is required for calendar_create_event`);
 
-	// Build the VEVENT block.
+	// Build the VEVENT block (Nextcloud requires the PUT resource to carry a name).
+	const uid = `${Math.random().toString(36).slice(2)}-pi-caldav`;
 	let ical = "BEGIN:VCALENDAR\nVERSION:2.0\nPRODID:-//pi-caldav//EN\n";
 	ical += "BEGIN:VEVENT\n";
 	ical += `DTSTART:${params.start.replace(/Z$/, "")}Z\n`;
 	ical += `DTEND:${params.end.replace(/Z$/, "")}Z\n`;
-	ical += `UID:${Math.random().toString(36).slice(2)}-pi-caldav\n`;
+	ical += `UID:${uid}\n`;
 	ical += `SUMMARY:${params.summary}\n`;
 	if (params.description) ical += `DESCRIPTION:${params.description}\n`;
 	if (params.location) ical += `LOCATION:${params.location}\n`;
 	ical += "END:VEVENT\n";
 	ical += "END:VCALENDAR\n";
 
-	const res = await webdav("PUT", path, ical);
+	const res = await webdav("PUT", `${path}/${uid}.ics`, ical);
 	return {
 		content: [
 			{
@@ -526,8 +602,8 @@ async function executeCreateEvent(params: {
 async function executeTaskList(params: { calendar: string }) {
 	let path = params.calendar;
 	if (!/^https?:\/\//.test(path) && !path.startsWith("/remote.php")) {
-		// Resolve the task list to its Nextcloud location before requesting it.
-		path = `${TASK_LIST_ROOT}${params.calendar}/tasks`;
+		// A bare name resolves to the user's task list collection.
+		path = `${TASK_LIST_ROOT}${params.calendar.replace(/\/+$/, "")}/tasks`;
 	} else {
 		path = normalizeHref(path);
 	}
@@ -535,12 +611,12 @@ async function executeTaskList(params: { calendar: string }) {
 	let target = "";
 	for (const c of collections) {
 		if (/tasks/i.test(c.href)) {
-			target = `${c.href}/`;
+			target = `${c.href.replace(/\/+$/, "")}/`;
 			break;
 		}
 	}
-	if (!target && collections.length) target = `${collections[0].href}/`;
-	const res = await webdav("REPORT", target, reportQueryXml("", ""));
+	if (!target && collections.length) target = `${collections[0].href.replace(/\/+$/, "")}/`;
+	const res = await reportEvents(target, undefined, undefined, "VTODO");
 	const tasks = parseReport(res);
 	return {
 		content: [

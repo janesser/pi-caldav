@@ -12,18 +12,18 @@
 pi install git:github.com/janesser/pi-caldav
 ```
 
-Then set the three environment variables (`PI_CALENDAR_URL`, `PI_CALENDAR_USER`,
-`PI_CALENDAR_PASSWORD`) and restart pi-agent, or `/reload` if it is running.
-
-A convenient way to provision them: write these three lines to a file such as
-`~/.pi/agent/.env-caldav` and make it readable only by you (chmod 600 it), then source it in
-the shell that starts pi-agent before launching it, e.g. `set -a; source ~/.pi/agent/.env-caldav; set +a`:
+The extension picks up the three credentials itself, so you only need to write them down once and restart pi-agent, or `/reload` if it is running:
 
 ```bash
+cat > ~/.pi/agent/.env-caldav <<'EOF'
 PI_CALENDAR_URL=https://<caldav-server-hostname>/
 PI_CALENDAR_USER=<username>
 PI_CALENDAR_PASSWORD=<app password>
+EOF
+chmod 600 ~/.pi/agent/.env-caldav
 ```
+
+Env vars still take precedence when both are present. `~/.pi/agent/.env-caldav` is enough for setups where the agent starts through a desktop launcher, `tmux`, or a systemd unit instead of your shell, so no extra wiring is needed.
 
 The extension is a single file loaded via jiti (`extensions/caldav.ts`). It carries its
 own request layer: every tool issues curl calls against the server through
@@ -38,11 +38,13 @@ own request layer: every tool issues curl calls against the server through
 | `task_list` | List VTODO tasks from a task list |
 
 Every tool takes the target calendar as its first parameter — a display name or the full
-CalDAV href. A bare name is enumerated at request time (PROPFIND on
-`/remote.php/caldav/calendars/<user>/`), so no discovery cache can go stale.
+CalDAV href. A bare name is enumerated at request time (PROPFIND against both
+`/remote.php/caldav/calendars/<user>/` and `/remote.php/dav/calendars/<user>/`, so no
+discovery cache can go stale), so pass the collection's display name or its full href.
 
 ## Troubleshooting
 
+- **`[caldav] credentials not set`** — the extension has no place to read the three credentials from. Write them to `~/.pi/agent/.env-caldav`, restart pi-agent, and confirm the warning is gone before calling any tool.
 - **401 responses** — check the app password in Nextcloud *Settings → Security*. The
   extension fails with `Calendar collection not accessible: 401 Unauthorized`.
 - **No collections found** — run a manual probe (replace `<username>` and the host with your own):
