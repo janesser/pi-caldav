@@ -1,0 +1,43 @@
+{
+  "name": "@janesser/pi-caldav",
+  "version": "0.1.0",
+  "description": "Connect pi to a CalDAV server (Nextcloud) for calendar events and tasks",
+  "keywords": [
+    "pi-package"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/janesser/pi-caldav.git"
+  },
+  "homepage": "https://github.com/janesser/pi-caldav#readme",
+  "bugs": {
+    "type": "git",
+    "url": "https://github.com/janesser/pi-caldav/issues"
+  },
+  "author": "janesser",
+  "license": "MIT",
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ],
+    "skills": [
+      "./skills"
+    ]
+  },
+  "files": [
+    "extensions",
+    "skills",
+    "scripts",
+    "handover.md",
+    "README.md",
+    "LICENSE"
+  ],
+  "dependencies": {},
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "bundledDependencies": [],
+  "scripts": {},
+  "type": "module"
+}

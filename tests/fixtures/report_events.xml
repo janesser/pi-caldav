@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="utf-8"?>
+<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:response>
+    <d:href>/remote.php/caldav/calendars/testuser/Familie-Esser/e47bb0c9-1a2b-3c4d-5e6f-7a8b9c0d1e2f.ics</d:href>
+    <d:propstat>
+      <d:prop>
+        <c:calendar-data><![CDATA[BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Test//EN
+BEGIN:VEVENT
+UID:e47bb0c9-1a2b-3c4d-5e6f-7a8b9c0d1e2f
+SUMMARY:Sprint Planning
+DTSTART:20261113T100000Z
+DTEND:20261113T113000Z
+DESCRIPTION:Plan the quarter.
+LOCATION:HQ Meeting Room A
+END:VEVENT
+END:VCALENDAR]]></c:calendar-data>
+      </d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+  </d:response>
+  <d:response>
+    <d:href>/remote.php/caldav/calendars/testuser/Familie-Esser/f9c8d7e6-5a4b-3c2d-1e0f-9a8b7c6d5e4f.ics</d:href>
+    <d:propstat>
+      <d:prop>
+        <c:calendar-data><![CDATA[BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Test//EN
+BEGIN:VEVENT
+UID:f9c8d7e6-5a4b-3c2d-1e0f-9a8b7c6d5e4f
+SUMMARY:Lunch with Jan
+DTSTART:20261114T120000Z
+DTEND:20261114T130000Z
+DESCRIPTION:Catch up.
+LOCATION:Restaurant
+END:VEVENT
+END:VCALENDAR]]></c:calendar-data>
+      </d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+  </d:response>
+</d:multistatus>
