@@ -193,6 +193,101 @@ CREATED_RESPONSE = """<?xml version="1.0" encoding="utf-8"?>
 <d:multistatus xmlns:d="DAV:"/>
 """
 
+# A PROPFIND of one task resource returns its iCal body, the way Nextcloud does.
+# A PUT to that URL replaces the whole resource, which is how the extension
+# patches a task's status back into the server. The template fills in the task it
+# reports, so every test gets a consistent VTODO to patch.
+TASK_RESOURCE_TEMPLATE = """<?xml version="1.0" encoding="utf-8"?>
+<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:response>
+    <d:href>/remote.php/dav/calendars/%(user)s/tasks/%(uid)s.ics</d:href>
+    <d:propstat>
+      <d:prop>
+        <c:calendar-data><![CDATA[BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Test//EN
+BEGIN:VTODO
+UID:%(uid)s
+SUMMARY:%(summary)s
+DUE:%(due)sZ
+STATUS:%(status)s
+END:VTODO
+END:VCALENDAR]]></c:calendar-data>
+      </d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+  </d:response>
+</d:multistatus>
+"""
+
+
+def task_resource_response(uid, summary="Call the bank", due="20261120T180000",
+                           status="NEEDS-ACTION"):
+    """Return a single-resource PROPFIND body for one task."""
+    return TASK_RESOURCE_TEMPLATE % {
+        "user": MOCK_USER, "uid": uid, "summary": summary,
+        "due": due, "status": status,
+    }
+
+# An event resource reported back from a read-out (mirrors CALENDAR_RESPONSE).
+EVENT_RESOURCE_TEMPLATE = """<?xml version="1.0" encoding="utf-8"?>
+<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:response>
+    <d:href>/remote.php/caldav/calendars/%(user)s/%(calendar)s/%(uid)s.ics</d:href>
+    <d:propstat>
+      <d:prop>
+        <c:calendar-data><![CDATA[BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Test//EN
+BEGIN:VEVENT
+UID:%(uid)s
+SUMMARY:%(summary)s
+DTSTART:%(start)s
+DTEND:%(end)s
+DESCRIPTION:%(description)s
+LOCATION:%(location)s
+END:VEVENT
+END:VCALENDAR]]></c:calendar-data>
+      </d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+  </d:response>
+</d:multistatus>
+"""
+
+
+def event_resource_response(uid, summary="Sprint Planning", start="20261113T100000Z",
+                            end="20261113T113000Z", description="Plan the quarter.",
+                            location="HQ Meeting Room A", calendar="Familie-Esser"):
+    """Return a single-resource PROPFIND body for one event."""
+    return EVENT_RESOURCE_TEMPLATE % {
+        "user": MOCK_USER, "uid": uid, "summary": summary, "calendar": calendar,
+        "description": description, "location": location,
+        "start": start.replace('Z', ''), "end": end.replace('Z', ''),
+    }
+
+
+# Task resources the mock reports back from a read-out; anything else in that path
+# is a missing task (404) or an unknown calendar.
+KNOWN_TASK_UIDS = (
+    "7f6a2c4e-3e9a-4c5b-8f6a-1a2b3c4d5e6f",
+    "8a7b3d5f-4e0b-5c6d-9f7b-2a3b4c5d6e7f",
+)
+# The events this mock reports back from a read-out (mirrors CALENDAR_RESPONSE).
+KNOWN_EVENT_UIDS = (
+    "e47bb0c9-1a2b-3c4d-5e6f-7a8b9c0d1e2f",
+    "f9c8d7e6-5a4b-3c2d-1e0f-9a8b7c6d5e4f",
+    "a1b2c3d4-e5f6-7a8b-9c0d-1e2f3a4b5c6d",
+)
+EVENTS_BY_UID = {
+    "e47bb0c9-1a2b-3c4d-5e6f-7a8b9c0d1e2f": ("Sprint Planning", "20261113T100000Z",
+                                                "20261113T113000Z", "Plan the quarter.", "HQ Meeting Room A"),
+    "f9c8d7e6-5a4b-3c2d-1e0f-9a8b7c6d5e4f": ("Lunch with Jan", "20261114T120000Z",
+                                              "20261114T130000Z", "Catch up.", "Restaurant"),
+    "a1b2c3d4-e5f6-7a8b-9c0d-1e2f3a4b5c6d": ("Fallback test event", "20261115T090000Z",
+                                             "20261115T093000Z", "", ""),
+}
+
 
 class MockCalDAVHandler(BaseHTTPRequestHandler):
     """Respond to CalDAV operations with fixture XML."""
@@ -276,6 +371,19 @@ class MockCalDAVHandler(BaseHTTPRequestHandler):
         print(f"[caldav-mock] PROPFIND {path}", flush=True)
         if self._unknown_calendar():
             return
+        # A specific task or event resource returns its own iCal body (patchable with
+        # a PUT); an unknown resource in a collection is gone already.
+        m = re.match(r"/remote\.php/(?:caldav|dav)/calendars/[^/]+/(tasks|[^/]+)/([^/]+)\.ics$", path)
+        if m:
+            uid = m.group(2)
+            if m.group(1) == "tasks" and uid in KNOWN_TASK_UIDS:
+                self.respond(207, {}, task_resource_response(uid))
+            elif uid in EVENTS_BY_UID:
+                summary, start, end, description, location = EVENTS_BY_UID[uid]
+                self.respond(207, {}, event_resource_response(uid, summary, start, end, description, location))
+            else:
+                self.respond(404, {}, "Not Found")
+            return
         if "/remote.php/dav/calendars/" in path and path.endswith("/tasks"):
             body = TASKS_RESPONSE
         else:
@@ -314,6 +422,24 @@ class MockCalDAVHandler(BaseHTTPRequestHandler):
             return
         # Default to Nextcloud's 201 Created; MOCK_PUT_STATUS overrides it.
         self.respond(MOCK_PUT_STATUS, {}, CREATED_RESPONSE)
+
+    def do_DELETE(self):
+        if not self.check_auth():
+            self.respond(401, {"WWW-Authenticate": 'Basic realm="cal"'}, "Unauthorized")
+            return
+        path = self._path()
+        print(f"[caldav-mock] DELETE {path}", flush=True)
+        if self._unknown_calendar():
+            return
+        # Only known task and event resources are removed; everything else is gone.
+        m = re.match(r"/remote\.php/(?:caldav|dav)/calendars/[^/]+/(tasks|[^/]+)/([^/]+)\.ics$", path)
+        if not m or (
+            (m.group(1) == "tasks" and m.group(2) not in KNOWN_TASK_UIDS)
+            or (m.group(1) != "tasks" and m.group(2) not in EVENTS_BY_UID)
+        ):
+            self.respond(404, {}, "Not Found")
+            return
+        self.respond(204, {}, CREATED_RESPONSE)
 
     def do_OPTIONS(self):
         # Allow the extension's discovery of WebDAV capabilities.

@@ -97,6 +97,8 @@ interface ICalRecord {
 	location: string;
 	due?: string;
 	status?: string;
+	href?: string;
+	component?: string;   // VEVENT / VTODO
 	raw: string;
 }
 
@@ -124,6 +126,9 @@ function parseICalBlocks(ical: string): ICalRecord[] {
 				location: props["LOCATION"] || "",
 				due: normalizeIso(props["DUE"]),
 				status: props["STATUS"],
+				// `.raw` is the block's content without its BEGIN:/END: wrapper, so the
+				// component name lets callers rebuild a complete record.
+				component: currentType,
 				raw: buffer.trim(),
 			});
 			currentType = "";
@@ -515,15 +520,20 @@ async function reportEvents(
 	return webdav("REPORT", normalizeHref(calendar), reportQueryXml(component, from, to), ["Depth: 1"]);
 }
 
-/** Parse a REPORT response into events/tasks. */
+/** Parse a REPORT/PROPFIND response into events/tasks, carrying each resource href. */
 function parseReport(res: WebDavResult): ICalRecord[] {
 	const root = parseXml(res.body);
-	const blocks: string[] = [];
+	const records: ICalRecord[] = [];
 	for (const response of findAll(root, "response")) {
 		const data = findText(response, "calendar-data");
-		if (data) blocks.push(data);
+		if (!data) continue;
+		// The resource href is reported alongside its iCal so writes can target it.
+		const href = findText(response, "href").replace(/\/$/, "");
+		for (const record of parseICalBlocks(data)) {
+			records.push({ ...record, href });
+		}
 	}
-	return parseICalBlocks(blocks.join("\n"));
+	return records;
 }
 
 // ── Tools ─────────────────────────────────────────────────────────────
@@ -539,7 +549,7 @@ async function executeListEvents(params: { calendar: string; from?: string; to?:
 				type: "text",
 				text: events.length
 					? `Events for ${params.calendar} (${events.length} found)\n${events
-							.map((e) => `${e.start ? e.start : ""} | ${e.summary || "(no summary)"} | end: ${e.end}`)
+							.map((e) => `${e.start ? e.start : ""} | ${e.summary || "(no summary)"} | end: ${e.end} | href: ${e.href}`)
 							.join("\n")}`
 					: `No events found for ${params.calendar}`,
 			},
@@ -598,6 +608,249 @@ async function executeCreateEvent(params: {
 	};
 }
 
+/**
+ * Resolve the task list collection that a write targets.
+ *
+ * A bare name resolves to the user's task list collection (the well-known
+ * Nextcloud location), an href is used as-is. Always at request time so no
+ * stale collection state leaks between sessions.
+ */
+async function resolveTaskCollection(calendar: string): Promise<string> {
+	// An explicit href is used as-is; discovery is only needed for a bare name.
+	if (/^https?:\/\//.test(calendar) || calendar.startsWith("/remote.php")) return normalizeHref(calendar);
+	return `${TASK_LIST_ROOT}${PI_CALENDAR_USER}/tasks`;
+}
+
+/** Build a task resource URL from an href, or from list + UID (`task_list` reports it back). */
+async function resolveTaskResource(params: {
+	href?: string;
+	uid?: string;
+	calendar?: string;
+}): Promise<string | undefined> {
+	if (params.href) return normalizeHref(params.href);
+	if (!params.uid || !params.calendar) return undefined;
+	const collection = await resolveTaskCollection(params.calendar);
+	return `${collection.replace(/\/$/, "")}/${params.uid}.ics`;
+}
+
+/** Read one CalDAV resource's iCal body (PROPFIND with calendar-data).
+ *
+ * A PUT replaces the whole resource, so writes need to patch the existing body
+ * instead of clobbering it — this is how the current content is fetched.
+ */
+async function readResource(resource: string): Promise<string> {
+	const res = await webdav(
+		"PROPFIND",
+		normalizeHref(resource),
+		`<d:propfind xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:prop><c:calendar-data/></d:prop></d:propfind>`,
+		["Depth: 1"],
+	);
+	const records = parseReport(res);
+	if (!records.length) return "";
+	// `.raw` is the block's content without its BEGIN:/END: wrapper, so rebuild a
+	// complete record — a fragment would not re-parse.
+	const { component, raw } = records[0];
+	return `BEGIN:${component}\n${raw}\nEND:${component}\n`;
+}
+
+/**
+ * Resolve an event resource URL from an href, or from the event's calendar and UID.
+ *
+ * An event lives under `<calendar>/<uid>.ics` in the calendar collection that holds
+ * it (which `resolveCalendar` enumerates at request time), unlike a task that lives
+ * in the user's task list.
+ */
+async function resolveEventResource(params: {
+	href?: string;
+	uid?: string;
+	calendar?: string;
+}): Promise<string | undefined> {
+	if (params.href) return normalizeHref(params.href);
+	if (!params.uid || !params.calendar) return undefined;
+	const collection = await resolveCalendar(params.calendar);
+	return `${collection.replace(/\/$/, "")}/${params.uid}.ics`;
+}
+
+/**
+ * Normalize an iCal date the way this extension emits it: UTC datetimes keep their Z,
+ * plain dates stay bare (so a VEVENT's DTSTART/DTEND are rebuilt correctly). The value
+ * the parser hands back has already lost its Z suffix.
+ */
+function formatIsoDate(raw?: string): string {
+	return raw ? (/T/.test(raw) ? `${raw.replace(/Z$/, "")}Z` : raw) : "";
+}
+
+/** Update a VEVENT (PUT). Nextcloud stores each event as its own resource. */
+async function executeEventUpdate(params: {
+	href?: string;
+	uid?: string;
+	calendar?: string;
+	summary?: string;
+	start?: string;
+	end?: string;
+	description?: string;
+	location?: string;
+	status?: string;
+}) {
+	const href = await resolveEventResource(params);
+	if (!href) throw new Error(`event_update requires an href, or a calendar and uid`);
+
+	// The resource is replaced on PUT, so patch its current body instead of clobbering it.
+	const ical = await readResource(href);
+	if (!ical) throw new Error(`Event not found: ${href}`);
+
+	const record = parseICalBlocks(ical)[0];
+	let body = "BEGIN:VCALENDAR\nVERSION:2.0\nPRODID:-//pi-caldav//EN\n";
+	body += "BEGIN:VEVENT\n";
+	body += `UID:${record.uid}\n`;
+	body += `SUMMARY:${params.summary ?? record.summary}\n`;
+	body += `DTSTART:${formatIsoDate(params.start || record.start)}\n`;
+	body += `DTEND:${formatIsoDate(params.end || record.end)}\n`;
+	if (params.description) body += `DESCRIPTION:${params.description}\n`; else if (record.description) body += `DESCRIPTION:${record.description}\n`;
+	if (params.location) body += `LOCATION:${params.location}\n`; else if (record.location) body += `LOCATION:${record.location}\n`;
+	if (params.status) body += `STATUS:${params.status}\n`;
+	body += "END:VEVENT\n";
+	body += "END:VCALENDAR\n";
+
+	const res = await webdav("PUT", toPath(href), body);
+	return {
+		content: [
+			{
+				type: "text",
+				text: res.code === 201 || res.code === 204
+					? `Event ${record.uid} updated (HTTP ${res.code})`
+					: `Event ${record.uid} updated (${JSON.stringify(res.headers)})`,
+			},
+		],
+		details: { href, status: res.code },
+	};
+}
+
+/** Delete an event resource (DELETE). Nextcloud stores each event as its own resource. */
+async function executeEventDelete(params: {
+	href?: string;
+	uid?: string;
+	calendar?: string;
+}) {
+	const href = await resolveEventResource(params);
+	if (!href) throw new Error(`event_delete requires an href, or a calendar and uid`);
+
+	const res = await webdav("DELETE", toPath(href));
+	return {
+		content: [
+			{
+				type: "text",
+				text: res.code === 204 || res.code === 200
+					? `Event ${href} deleted`
+					: `Event ${href} deleted (${JSON.stringify(res.headers)})`,
+			},
+		],
+		details: { href, status: res.code },
+	};
+}
+
+/** Update a VTODO's status (PUT). Nextcloud stores each task as its own resource. */
+async function executeTaskUpdateStatus(params: {
+	href?: string;
+	uid?: string;
+	calendar?: string;
+	status: string;
+}) {
+	// Validate the parameters before any discovery or PUT work.
+	if (!params.status) throw new Error(`task_update_status requires a status`);
+	const href = await resolveTaskResource(params);
+	if (!href) throw new Error(`task_update_status requires an href, or a calendar and uid`);
+
+	// The resource is replaced on PUT, so patch its current body instead of clobbering it.
+	const ical = await readResource(href);
+	if (!ical) throw new Error(`Task not found: ${href}`);
+
+	const record = parseICalBlocks(ical)[0];
+	let body = "BEGIN:VCALENDAR\nVERSION:2.0\nPRODID:-//pi-caldav//EN\n";
+	body += "BEGIN:VTODO\n";
+	body += `UID:${record.uid}\n`;
+	body += `SUMMARY:${record.summary}\n`;
+	// iCal date-times are emitted in UTC, so keep the value there (the parsed value
+	// has lost its Z suffix); plain dates stay as-is.
+	const due = record.due ? (/T/.test(record.due) ? `${record.due}Z` : record.due) : "";
+	if (due) body += `DUE:${due}\n`;
+	if (record.description) body += `DESCRIPTION:${record.description}\n`;
+	body += `STATUS:${params.status}\n`;
+	body += "END:VTODO\n";
+	body += "END:VCALENDAR\n";
+
+	const res = await webdav("PUT", toPath(href), body);
+	return {
+		content: [
+			{
+				type: "text",
+				text: res.code === 201 || res.code === 204
+					? `Task ${record.uid} status updated to ${params.status} (HTTP ${res.code})`
+					: `Task ${record.uid} status updated to ${params.status} (${JSON.stringify(res.headers)})`,
+			},
+		],
+		details: { href, status: params.status, uid: record.uid, calendar: params.calendar },
+	};
+}
+
+/** Delete a task resource (DELETE). Nextcloud stores each task as its own resource. */
+async function executeTaskDelete(params: {
+	href?: string;
+	uid?: string;
+	calendar?: string;
+}) {
+	const href = await resolveTaskResource(params);
+	if (!href) throw new Error(`task_delete requires an href, or a calendar and uid`);
+
+	const res = await webdav("DELETE", toPath(href));
+	return {
+		content: [
+			{
+				type: "text",
+				text: res.code === 204 || res.code === 200
+					? `Task ${href} deleted`
+					: `Task ${href} deleted (${JSON.stringify(res.headers)})`,
+			},
+		],
+		details: { href, status: res.code },
+	};
+}
+
+/** Create a VTODO in a task list collection (PUT). */
+async function executeTaskCreate(params: { calendar: string; summary: string; due?: string; description?: string }) {
+	// Validate the parameters before any discovery or PUT work.
+	if (!params.summary) {
+		throw new Error(`task_create requires a summary`);
+	}
+	const collection = await resolveTaskCollection(params.calendar);
+	const path = toPath(collection);
+	if (!path) throw new Error(`calendar parameter is required for task_create`);
+
+	// Build the VTODO block (Nextcloud stores each task as its own resource).
+	const uid = `${Math.random().toString(36).slice(2)}-pi-caldav`;
+	let ical = "BEGIN:VCALENDAR\nVERSION:2.0\nPRODID:-//pi-caldav//EN\n";
+	ical += "BEGIN:VTODO\n";
+	ical += `UID:${uid}\n`;
+	ical += `SUMMARY:${params.summary}\n`;
+	if (params.due) ical += `DUE:${params.due.replace(/Z$/, "")}Z\n`;
+	if (params.description) ical += `DESCRIPTION:${params.description}\n`;
+	ical += "END:VTODO\n";
+	ical += "END:VCALENDAR\n";
+
+	const res = await webdav("PUT", `${path}/${uid}.ics`, ical);
+	return {
+		content: [
+			{
+				type: "text",
+				text: res.code === 201 || res.code === 204
+					? `Task created on ${params.calendar} (HTTP ${res.code})`
+					: `Task created on ${params.calendar} (${JSON.stringify(res.headers)})`,
+			},
+		],
+		details: { calendar: params.calendar, href: `${path}/${uid}.ics`, status: res.code },
+	};
+}
+
 /** List tasks from a task list collection (Nextcloud: /remote.php/dav/calendars/<user>/tasks). */
 async function executeTaskList(params: { calendar: string }) {
 	let path = params.calendar;
@@ -623,7 +876,7 @@ async function executeTaskList(params: { calendar: string }) {
 			{
 				type: "text",
 				text: tasks.length
-					? `Tasks for ${params.calendar} (${tasks.length} found)\n${tasks.map((t) => `${t.summary || "(no summary)"} | due: ${t.due || "-"} | status: ${t.status || "-"}`).join("\n")}`
+					? `Tasks for ${params.calendar} (${tasks.length} found)\n${tasks.map((t) => `${t.summary || "(no summary)"} | due: ${t.due || "-"} | status: ${t.status || "-"} | href: ${t.href}`).join("\n")}`
 					: `No tasks found for ${params.calendar}`,
 			},
 		],
@@ -709,6 +962,137 @@ export default function (pi: ExtensionAPI) {
 			_signal?: AbortSignal,
 		) {
 			return await executeTaskList(params);
+		},
+	});
+
+	// ── Tool: task_create ─────────────────────────────────────────────
+
+	piApi.registerTool({
+		name: "task_create",
+		label: "Create Calendar Task",
+		description:
+			"Create a task in a CalDAV task list. Pass `calendar` (name or URL) for the calendar that holds the task lists, plus `summary` and optional `due`/`description`.",
+		parameters: Type.Object({
+			calendar: Type.String({ description: "The task list name or full href." }),
+			summary: Type.String({ description: "Task title." }),
+			due: Type.Optional(Type.String({ description: "Due date (ISO-8601)." })),
+			description: Type.Optional(Type.String({ description: "Task body." })),
+		}),
+		async execute(
+			_toolCallId: string,
+			params: { calendar: string; summary: string; due?: string; description?: string },
+			_signal?: AbortSignal,
+		) {
+			return await executeTaskCreate(params);
+		},
+	});
+
+	// ── Tool: task_update_status ────────────────────────────────────
+
+	piApi.registerTool({
+		name: "task_update_status",
+		label: "Update Calendar Task Status",
+		description:
+		"Mark a CalDAV task done (or change its status). Pass `href` (the task's resource URL) or `calendar` + `uid`, plus the new `status`.",
+		parameters: Type.Object({
+			href: Type.Optional(
+				Type.String({ description: "The task's resource URL, e.g. from `task_list` details." }),
+			),
+			uid: Type.Optional(Type.String({ description: "Task UID (used with `calendar`)." })),
+			calendar: Type.Optional(Type.String({ description: "The task list name or href (used with `uid`)." })),
+			status: Type.String({ description: "New status, e.g. COMPLETED." }),
+		}),
+		async execute(
+			_toolCallId: string,
+			params: { href?: string; uid?: string; calendar?: string; status: string },
+			_signal?: AbortSignal,
+		) {
+			return await executeTaskUpdateStatus(params);
+		},
+	});
+
+	// ── Tool: task_delete ─────────────────────────────────────────────
+
+	piApi.registerTool({
+		name: "task_delete",
+		label: "Delete Calendar Task",
+		description:
+			"Delete a CalDAV task resource. Pass `href` (the task's resource URL) or `calendar` + `uid`.",
+		parameters: Type.Object({
+			href: Type.Optional(
+				Type.String({ description: "The task's resource URL, e.g. from `task_list` details." }),
+			),
+			uid: Type.Optional(Type.String({ description: "Task UID (used with `calendar`)." })),
+			calendar: Type.Optional(Type.String({ description: "The task list name or href (used with `uid`)." })),
+		}),
+		async execute(
+			_toolCallId: string,
+			params: { href?: string; uid?: string; calendar?: string },
+			_signal?: AbortSignal,
+		) {
+			return await executeTaskDelete(params);
+		},
+	});
+
+	// ── Tool: event_update ────────────────────────────────────────────
+
+	piApi.registerTool({
+		name: "event_update",
+		label: "Update Calendar Event",
+		description:
+			"Update a CalDAV event (VEVENT). Pass `href` (the event's resource URL, e.g. from `calendar_list_events` details) or `calendar` + `uid`, plus the fields to change.",
+		parameters: Type.Object({
+			href: Type.Optional(
+				Type.String({ description: "The event's resource URL, e.g. from `calendar_list_events` details." }),
+			),
+			uid: Type.Optional(Type.String({ description: "Event UID (used with `calendar`)." })),
+			calendar: Type.Optional(Type.String({ description: "The calendar name or href (used with `uid`)." })),
+			summary: Type.Optional(Type.String({ description: "New event title." })),
+			start: Type.Optional(Type.String({ description: "New start time (ISO-8601)." })),
+			end: Type.Optional(Type.String({ description: "New end time (ISO-8601)." })),
+			description: Type.Optional(Type.String({ description: "New event body." })),
+			location: Type.Optional(Type.String({ description: "New event location." })),
+			status: Type.Optional(Type.String({ description: "New status, e.g. CONFIRMED." })),
+		}),
+		async execute(
+			_toolCallId: string,
+			params: {
+				href?: string;
+				uid?: string;
+				calendar?: string;
+				summary?: string;
+				start?: string;
+				end?: string;
+				description?: string;
+				location?: string;
+				status?: string;
+			},
+			_signal?: AbortSignal,
+		) {
+			return await executeEventUpdate(params);
+		},
+	});
+
+	// ── Tool: event_delete ────────────────────────────────────────────
+
+	piApi.registerTool({
+		name: "event_delete",
+		label: "Delete Calendar Event",
+		description:
+			"Delete a CalDAV event resource. Pass `href` (the event's resource URL, e.g. from `calendar_list_events` details) or `calendar` + `uid`.",
+		parameters: Type.Object({
+			href: Type.Optional(
+				Type.String({ description: "The event's resource URL, e.g. from `calendar_list_events` details." }),
+			),
+			uid: Type.Optional(Type.String({ description: "Event UID (used with `calendar`)." })),
+			calendar: Type.Optional(Type.String({ description: "The calendar name or href (used with `uid`)." })),
+		}),
+		async execute(
+			_toolCallId: string,
+			params: { href?: string; uid?: string; calendar?: string },
+			_signal?: AbortSignal,
+		) {
+			return await executeEventDelete(params);
 		},
 	});
 

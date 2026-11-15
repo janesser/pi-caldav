@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:response>
+    <d:href>/remote.php/dav/calendars/testuser/tasks/7f6a2c4e-3e9a-4c5b-8f6a-1a2b3c4d5e6f.ics</d:href>
+    <d:propstat>
+      <d:prop>
+        <c:calendar-data><![CDATA[BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Test//EN
+BEGIN:VTODO
+UID:7f6a2c4e-3e9a-4c5b-8f6a-1a2b3c4d5e6f
+SUMMARY:Call the bank
+DUE:20261120T180000Z
+STATUS:NEEDS-ACTION
+END:VTODO
+END:VCALENDAR]]></c:calendar-data>
+      </d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+  </d:response>
+</d:multistatus>
