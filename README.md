@@ -71,6 +71,9 @@ Implemented and tested. The extension is a single curl-driven WebDAV client load
 - `calendar_create_event` — resolves the calendar and PUTs a VEVENT to the collection.
 - `task_list` — enumerates `/remote.php/dav/calendars/<user>/tasks` and parses VTODOs
   (summary, due, status, uid).
+- Connection indicator — on session start the extension reports its connection in the chat window's
+  status bar: `● <host> · <n> collections` when reachable, `✕ <error>` when it isn't. It is
+  best-effort and never blocks startup.
 
 ## Testing
 
@@ -86,6 +89,8 @@ No network is touched: `python3 -m unittest discover -s tests`.
 ```bash
 python3 -m unittest discover -s tests   # all unit + integration tests, no network
 node --experimental-strip-types -e "import('./extensions/caldav.ts')"  # extension loads
+node --experimental-strip-types tests/test_status.js  # connection-state formatter
+node --experimental-strip-types tests/test_probe.js   # probe states (stubbed exec)
 ```
 
 ## Conventions (from pi-signal)

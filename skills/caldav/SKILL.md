@@ -42,6 +42,53 @@ CalDAV href. A bare name is enumerated at request time (PROPFIND against both
 `/remote.php/caldav/calendars/<user>/` and `/remote.php/dav/calendars/<user>/`, so no
 discovery cache can go stale), so pass the collection's display name or its full href.
 
+## Usage
+
+How to use the tools in practice — how dates are decided, what an answer should carry, and
+when the connection is worth checking first.
+
+### Dates
+
+- **Use the local `date` command to compute relative dates.** The CalDAV server interprets
+  `from`/`to` in its own timezone; if you derive a relative window from your own clock instead
+  of asking the host for `now`, you will query the wrong interval (a server's "next week"
+  agrees with the agent's only if both clocks agree).
+- **State every date as ISO-8601 with an explicit offset or UTC (`Z`).** Bare values like
+  `2026-11-18T09:00` are ambiguous to a naive parser — always emit `Z` (or `+02:00`) so the
+  server and the agent agree on what the value means.
+
+### Always report a week ahead
+
+When asked about the calendar, additionally report the next 7 days. A bare "today" answer only
+tells you what is already happening; `calendar_list_events` returns exactly what was queried, so
+query for the window you actually want to know about (e.g. today **and** the coming week), and
+frame the result around it.
+
+### Identification
+
+- **Echo back `href` when you pass `calendar`.** The tool accepts a name or href, but every read
+  result carries each resource's href — writes (`event_update`, `task_delete`) target it directly,
+  so returning it with the answer removes a discovery round trip from each write.
+- **Pass the collection's display name or its full href.** A server usually exposes one CalDAV
+  root and multiple collections (calendars); never pass just a folder path. The tool enumerates
+  the collections at request time, so discovery is free and fresh.
+- **Ask for tasks from the right root.** `task_list` needs `/remote.php/dav/calendars/<user>/tasks`
+  — if that collection does not exist on the server, report it as a gap rather than an empty
+  task list; the two are different facts.
+
+### Connection state
+
+- **Fail loudly on missing credentials, not at first call.** The extension warns at load time when
+  `.env-caldav` is unreadable; until that warning is gone nothing will work.
+- **Check the status bar before probing.** The extension reports its connection in the chat window
+  status (crossbar-style): `● <server> · <n> collections` when reachable, `✕ <error>` when it isn't.
+
+### Writes
+
+- Write tools are single-shot: they PUT or DELETE a known resource href. Use the href from the read
+  result; when you only have `uid` + `calendar`, `task_update_status` and `event_update` resolve it
+  for you.
+
 ## Troubleshooting
 
 - **`[caldav] credentials not set`** — the extension has no place to read the three credentials from. Write them to `~/.pi/agent/.env-caldav`, restart pi-agent, and confirm the warning is gone before calling any tool.

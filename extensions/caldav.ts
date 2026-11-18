@@ -1,7 +1,12 @@
 // TypeScript types are provided by pi at runtime via jiti.
 // This extension uses runtime-only imports; type checking is skipped.
 
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type {
+	ExtensionAPI,
+	ExtensionContext,
+	Theme,
+	ThemeColor,
+} from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { readFileSync } from "node:fs";
 
@@ -889,6 +894,126 @@ async function executeTaskList(params: { calendar: string }) {
 	};
 }
 
+// ── Status bar widget — show which CalDAV remotes are connected ────────
+/**
+ * The extension reports its connection in the chat window's status bar,
+ * modelled on Crossbar's loaded-model widget: a marker, the server host and what
+ * is reachable there. It is best-effort: never throws, never blocks startup.
+ *
+ * Pure functions:
+ *  - `formatCaldavState`
+ *  - `probeCaldav`
+ *
+ * Installation (in the lifecycle block): wires to `ctx.ui.setStatus` on
+ * `session_start` and clears it on `session_shutdown`.
+ */
+
+/** Status key used with `ctx.ui.setStatus`, rendered in the chat window. */
+const STATUS_KEY = "caldav";
+
+/** How the extension reports its connection to the chat window's status bar. */
+type CalDavState =
+	| { kind: "unconfigured" }                 // no credentials found anywhere
+	| { kind: "auth-failed"; url: string }     // 401 from the server
+	| { kind: "unreachable"; url: string; error: string }  // no response at all
+	| { kind: "connected"; url: string; collections: CalCollection[] };  // connected + discovered
+
+/** Fallback for environments without a TUI theme (no colors, plain text). */
+function defaultTheme(): Pick<Theme, "fg"> {
+	return { fg: (_color: ThemeColor, text: string) => text };
+}
+
+/** Render one connection state as a status-bar line, or "" to clear it. */
+export function formatCaldavState(state: CalDavState, theme?: Pick<Theme, "fg">): string {
+	const fg = (color: ThemeColor, text: string) => (theme?.fg ?? defaultTheme().fg)(color, text);
+
+	if (state.kind === "unconfigured") {
+		return `${fg("warning", "\u2716")} no credentials`;
+	}
+
+	// Only the host matters here — paths are for the tools. `.host` keeps the port
+	// when it is not 80/443, so self-hosted servers stay identifiable.
+	let host: string;
+	try {
+		host = new URL(state.url).host.replace(/^www\./, "");
+	} catch {
+		host = state.url;
+	}
+
+	if (state.kind === "auth-failed") {
+		return `${fg("warning", "\u2716")} ${fg("dim", `${host}: auth failed`)}`;
+	}
+	if (state.kind === "unreachable") {
+		return `${fg("dim", "\u25cb")} ${fg("dim", `${host}: ${state.error}`)}`;
+	}
+
+	const marker = fg("accent", "\u25cf");
+	const text = fg(
+		"success",
+		`${host} · ${state.collections.length} collection${state.collections.length === 1 ? "" : "s"}`,
+	);
+	return `${marker} ${text}`;
+}
+
+/**
+ * Probe the configured CalDAV root and report its connection state.
+ *
+ * Never throws: credentials missing → `unconfigured`, 401 → `auth-failed`, anything
+ * else → `unreachable`. Discovery happens at request time, so the reported
+ * collections are always fresh.
+ */
+export async function probeCaldav(): Promise<CalDavState> {
+	if (!PI_CALENDAR_URL || !PI_CALENDAR_USER || !PI_CALENDAR_PASSWORD) {
+		return { kind: "unconfigured" };
+	}
+
+	const url = normalizeBase();
+	for (const root of CALENDAR_ROOTS) {
+		try {
+			const collections = await propfind(`${root}${PI_CALENDAR_USER}/`);
+			return { kind: "connected", url, collections };
+		} catch (err) {
+			const error = err instanceof Error ? err.message : String(err);
+			// The first discovery root that fails surfaces its error (it points at the real server).
+			if (/401/.test(error)) return { kind: "auth-failed", url };
+			return { kind: "unreachable", url, error };
+		}
+	}
+	return { kind: "unconfigured" };
+}
+
+/**
+ * Wire the CalDAV connection indicator to Pi's status bar.
+ *
+ * - Discovers the connection at session start (and reports it in the chat window).
+ * - Clears the status key when the session ends so it does not linger in the bar.
+ */
+function installStatusWidget(pi: ExtensionAPI): () => void {
+	let ctx: ExtensionContext | undefined;
+	let disposed = false;
+
+	async function refresh(): Promise<void> {
+		if (disposed) return;
+		try {
+			const state = await probeCaldav();
+			const text = formatCaldavState(state, ctx?.ui.theme ?? defaultTheme());
+			ctx?.ui?.setStatus(STATUS_KEY, text.length > 0 ? text : undefined);
+		} catch {
+			// Best-effort: never break the session over a status update failure.
+		}
+	}
+
+	pi.on("session_start", async (_event: unknown, eventCtx: ExtensionContext) => {
+		ctx = eventCtx;
+		void refresh();
+	});
+
+	return () => {
+		disposed = true;
+		if (ctx?.ui) ctx.ui.setStatus(STATUS_KEY, undefined);
+	};
+}
+
 // ── Extension ──────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
@@ -1098,7 +1223,9 @@ export default function (pi: ExtensionAPI) {
 
 	// ── Lifecycle ───────────────────────────────────────────────────────
 
-	piApi.on("session_start", async (_event: unknown, _ctx: unknown) => {
+	const teardown = installStatusWidget(piApi);
+
+	piApi.on("session_start", async (_event: unknown, _ctx: ExtensionContext) => {
 		console.log("[caldav] extension loaded");
 		if (!PI_CALENDAR_URL || !PI_CALENDAR_USER || !PI_CALENDAR_PASSWORD) {
 			console.warn("[caldav] credentials not set — tools will fail at request time");
@@ -1107,5 +1234,6 @@ export default function (pi: ExtensionAPI) {
 
 	piApi.on("session_shutdown", async () => {
 		console.log("[caldav] extension unloaded");
+		teardown();
 	});
 }
